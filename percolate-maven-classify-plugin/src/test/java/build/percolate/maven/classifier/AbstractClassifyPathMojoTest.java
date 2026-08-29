@@ -6,10 +6,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -95,6 +97,45 @@ class AbstractClassifyPathMojoTest {
         AbstractClassifyPathMojo.writeArgfile(argfile, classification, Set.of());
 
         assertThat(argfile).exists();
+    }
+
+    @Test
+    void computeSeed_override_replacesPomSeedModules() {
+        final AbstractClassifyPathMojo mojo = new AbstractClassifyPathMojo() {
+            @Override
+            protected List<Path> getCandidates() {
+                return List.of();
+            }
+
+            @Override
+            protected Optional<Path> getSourceModuleInfo() {
+                throw new AssertionError("explicit seed must short-circuit before source module-info");
+            }
+
+            @Override
+            protected Path getArgfile() {
+                return Path.of("unused.args");
+            }
+
+            @Override
+            protected String getPropertyPrefix() {
+                return "percolate.classify.test";
+            }
+        };
+        setField(mojo, "seedModules", List.of("from.pom"));
+        setField(mojo, "seedModulesOverride", "  a.b   c.d  ");
+
+        assertThat(mojo.computeSeed(List.of())).containsExactly("a.b", "c.d");
+    }
+
+    private static void setField(final Object target, final String name, final Object value) {
+        try {
+            final Field field = AbstractClassifyPathMojo.class.getDeclaredField(name);
+            field.setAccessible(true);
+            field.set(target, value);
+        } catch (final ReflectiveOperationException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     @Test

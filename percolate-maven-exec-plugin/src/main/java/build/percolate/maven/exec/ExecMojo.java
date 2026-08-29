@@ -21,6 +21,7 @@ package build.percolate.maven.exec;
  */
 
 import build.percolate.core.ModuleGraphClassifier;
+import build.percolate.core.ParameterOverrides;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.DependencyResolutionRequiredException;
 import org.apache.maven.plugin.AbstractMojo;
@@ -105,10 +106,42 @@ public class ExecMojo extends AbstractMojo {
     private List<String> additionalJvmArgs;
 
     /**
+     * Whitespace-separated JVM flags, split into tokens and used <em>instead of</em>
+     * {@link #additionalJvmArgs} when non-blank.
+     * <p>
+     * {@link #additionalJvmArgs} is a {@code List<String>}, which Maven can only populate from
+     * POM {@code <additionalJvmArg>} elements — there's no way to override it from the command
+     * line. This property exists for exactly that case: overriding JVM flags ad-hoc as
+     * {@code -Dpercolate.exec.jvmArgs="--enable-preview -ea"} for dev-loop use, without editing
+     * the POM per invocation.
+     * <p>
+     * The property is the short {@code jvmArgs} rather than {@code additionalJvmArgs} because the
+     * latter is already bound as the {@code List} parameter's own property.
+     */
+    @Parameter(property = "percolate.exec.jvmArgs")
+    private String additionalJvmArgsOverride;
+
+    /**
      * Arguments passed to {@code mainClass} after the {@code -m} flag.
      */
     @Parameter(property = "percolate.exec.arguments")
     private List<String> arguments;
+
+    /**
+     * Whitespace-separated arguments passed to {@code mainClass}, split into tokens and used
+     * <em>instead of</em> {@link #arguments} when non-blank.
+     * <p>
+     * {@link #arguments} is a {@code List<String>}, which Maven can only populate from POM
+     * {@code <argument>} elements — there's no way to override it from the command line. This
+     * property exists for exactly that case: a POM execution that hardcodes no {@code <arguments>}
+     * of its own, invoked ad-hoc as {@code -Dpercolate.exec.args="task1 task2 --flag"} for
+     * dev-loop use, without editing the POM per invocation.
+     * <p>
+     * The property is the short {@code args} rather than {@code arguments} because the latter is
+     * already bound as the {@code List} parameter's own property.
+     */
+    @Parameter(property = "percolate.exec.args")
+    private String argumentsOverride;
 
     /**
      * Working directory for the forked process. Defaults to {@code ${project.basedir}}.
@@ -139,8 +172,8 @@ public class ExecMojo extends AbstractMojo {
         getLog().info("module-path=" + classification.modulePath().size()
             + " class-path=" + classification.classPath().size());
 
-        final List<String> command =
-            buildCommand(rootModule, mainClass, maxHeap, additionalJvmArgs, arguments, classification);
+        final List<String> command = buildCommand(
+            rootModule, mainClass, maxHeap, effectiveJvmArgs(), effectiveArguments(), classification);
         getLog().info("exec: " + String.join(" ", command));
 
         try {
@@ -156,6 +189,22 @@ public class ExecMojo extends AbstractMojo {
         } catch (final IOException | InterruptedException e) {
             throw new MojoExecutionException("exec failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * The arguments passed to {@code mainClass}: the whitespace-split {@link #argumentsOverride}
+     * when non-blank, else the POM {@link #arguments} list (possibly {@code null}).
+     */
+    List<String> effectiveArguments() {
+        return ParameterOverrides.resolveEffective(argumentsOverride, arguments);
+    }
+
+    /**
+     * The JVM flags for the forked process: the whitespace-split {@link #additionalJvmArgsOverride}
+     * when non-blank, else the POM {@link #additionalJvmArgs} list (possibly {@code null}).
+     */
+    List<String> effectiveJvmArgs() {
+        return ParameterOverrides.resolveEffective(additionalJvmArgsOverride, additionalJvmArgs);
     }
 
     private List<Path> resolveCandidates() throws DependencyResolutionRequiredException {
