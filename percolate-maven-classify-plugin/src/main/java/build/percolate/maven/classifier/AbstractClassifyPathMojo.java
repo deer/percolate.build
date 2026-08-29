@@ -21,6 +21,7 @@ package build.percolate.maven.classifier;
  */
 
 import build.percolate.core.ModuleGraphClassifier;
+import build.percolate.core.ParameterOverrides;
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.DependencyResolutionRequiredException;
 import org.apache.maven.plugin.AbstractMojo;
@@ -98,6 +99,24 @@ abstract class AbstractClassifyPathMojo extends AbstractMojo {
     @Parameter
     private List<String> seedModules;
 
+    /**
+     * Whitespace-separated module names, split into tokens and used <em>instead of</em>
+     * {@link #seedModules} when non-blank.
+     * <p>
+     * {@link #seedModules} is a {@code List<String>}, which Maven can only populate from POM
+     * {@code <seedModule>} elements — there's no way to override it from the command line. This
+     * property exists for exactly that case: pinning the seed set ad-hoc as
+     * {@code -Dpercolate.classify.seedModules="a.b c.d"} while debugging a classification,
+     * without editing the POM.
+     * <p>
+     * The property can reuse the plain {@code seedModules} name (rather than a distinct
+     * {@code seedModulesOverride}) because {@link #seedModules} itself declares no {@code property},
+     * so there is no collision — unlike the exec plugin, where the {@code List} parameters are
+     * already bound to their own properties and the overrides must use shorter names.
+     */
+    @Parameter(property = "percolate.classify.seedModules")
+    private String seedModulesOverride;
+
     protected abstract List<Path> getCandidates() throws DependencyResolutionRequiredException;
 
     protected abstract Optional<Path> getSourceModuleInfo();
@@ -164,11 +183,12 @@ abstract class AbstractClassifyPathMojo extends AbstractMojo {
         }
     }
 
-    private Set<String> computeSeed(final List<Path> candidates) {
-        // 1. Explicit override from the pom
-        if (seedModules != null && !seedModules.isEmpty()) {
+    Set<String> computeSeed(final List<Path> candidates) {
+        // 1. Explicit seed: command-line override, else the pom list
+        final List<String> explicitSeed = ParameterOverrides.resolveEffective(seedModulesOverride, seedModules);
+        if (explicitSeed != null && !explicitSeed.isEmpty()) {
             return ModuleGraphClassifier.closeOverRequires(
-                candidates, new LinkedHashSet<>(seedModules));
+                candidates, new LinkedHashSet<>(explicitSeed));
         }
 
         // 2. Source module-info.java, if present
