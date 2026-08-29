@@ -117,6 +117,12 @@ abstract class AbstractClassifyPathMojo extends AbstractMojo {
     @Parameter(property = "percolate.classify.seedModules")
     private String seedModulesOverride;
 
+    /**
+     * Skips execution of this goal when {@code true}.
+     */
+    @Parameter(property = "percolate.classify.skip", defaultValue = "false")
+    private boolean skip;
+
     protected abstract List<Path> getCandidates() throws DependencyResolutionRequiredException;
 
     protected abstract Optional<Path> getSourceModuleInfo();
@@ -136,6 +142,10 @@ abstract class AbstractClassifyPathMojo extends AbstractMojo {
 
     @Override
     public void execute() throws MojoExecutionException {
+        if (skip) {
+            getLog().info("percolate.classify.skip=true, skipping execution");
+            return;
+        }
         try {
             final List<Path> candidates = getCandidates();
             final Set<String> seed = computeSeed(candidates);
