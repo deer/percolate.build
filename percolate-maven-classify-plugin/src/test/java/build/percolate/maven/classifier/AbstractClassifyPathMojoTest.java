@@ -1,6 +1,7 @@
 package build.percolate.maven.classifier;
 
 import build.percolate.core.ModuleGraphClassifier;
+import org.apache.maven.plugin.logging.SystemStreamLog;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -15,6 +16,7 @@ import java.util.Optional;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 class AbstractClassifyPathMojoTest {
 
@@ -97,6 +99,35 @@ class AbstractClassifyPathMojoTest {
         AbstractClassifyPathMojo.writeArgfile(argfile, classification, Set.of());
 
         assertThat(argfile).exists();
+    }
+
+    @Test
+    void execute_skipTrue_returnsWithoutClassifying() {
+        final AbstractClassifyPathMojo mojo = new AbstractClassifyPathMojo() {
+            @Override
+            protected List<Path> getCandidates() {
+                throw new AssertionError("skip must short-circuit before getCandidates()");
+            }
+
+            @Override
+            protected Optional<Path> getSourceModuleInfo() {
+                return Optional.empty();
+            }
+
+            @Override
+            protected Path getArgfile() {
+                return Path.of("unused.args");
+            }
+
+            @Override
+            protected String getPropertyPrefix() {
+                return "percolate.classify.test";
+            }
+        };
+        mojo.setLog(new SystemStreamLog());
+        setField(mojo, "skip", true);
+
+        assertThatCode(mojo::execute).doesNotThrowAnyException();
     }
 
     @Test

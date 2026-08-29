@@ -1,6 +1,7 @@
 package build.percolate.maven.exec;
 
 import build.percolate.core.ModuleGraphClassifier;
+import org.apache.maven.plugin.logging.SystemStreamLog;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
@@ -9,6 +10,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 
 class ExecMojoTest {
 
@@ -117,6 +119,17 @@ class ExecMojoTest {
 
         assertThat(joined).isEqualTo(
             Path.of("/deps/a.jar") + File.pathSeparator + Path.of("/deps/b.jar"));
+    }
+
+    @Test
+    void execute_skipTrue_returnsWithoutTouchingProjectOrPlugin() {
+        final ExecMojo mojo = new ExecMojo();
+        mojo.setLog(new SystemStreamLog());
+        setField(mojo, "skip", true);
+
+        // project/pluginDescriptor/mainClass/rootModule are all left null; skip must short-circuit
+        // before any of them are touched, otherwise this throws NullPointerException.
+        assertThatCode(mojo::execute).doesNotThrowAnyException();
     }
 
     @Test

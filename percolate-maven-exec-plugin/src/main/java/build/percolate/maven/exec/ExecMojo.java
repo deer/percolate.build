@@ -149,8 +149,19 @@ public class ExecMojo extends AbstractMojo {
     @Parameter(property = "percolate.exec.workingDirectory", defaultValue = "${project.basedir}", required = true)
     private File workingDirectory;
 
+    /**
+     * Skips execution of this goal when {@code true}.
+     */
+    @Parameter(property = "percolate.exec.skip", defaultValue = "false")
+    private boolean skip;
+
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
+        if (skip) {
+            getLog().info("percolate.exec.skip=true, skipping execution");
+            return;
+        }
+
         final List<Path> candidates;
         try {
             candidates = resolveCandidates();
