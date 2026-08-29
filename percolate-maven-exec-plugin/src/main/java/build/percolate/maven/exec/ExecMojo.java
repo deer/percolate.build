@@ -41,7 +41,9 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -122,6 +124,17 @@ public class ExecMojo extends AbstractMojo {
     private String additionalJvmArgsOverride;
 
     /**
+     * System property name prefixes to forward from the parent (outer {@code mvn}) JVM to the
+     * forked process, as {@code -Dkey=value}. Empty by default: {@code mvn}'s own JVM carries
+     * many built-in properties ({@code java.home}, {@code user.dir}, ...) that would be wrong or
+     * redundant to hand to the child, and there's no reliable way to tell those apart from
+     * properties the user actually passed with {@code -D}. Listing prefixes (e.g. {@code myapp.})
+     * is how the caller opts specific ones in.
+     */
+    @Parameter(property = "percolate.exec.forwardSystemProperties")
+    private List<String> forwardSystemProperties;
+
+    /**
      * Arguments passed to {@code mainClass} after the {@code -m} flag.
      */
     @Parameter(property = "percolate.exec.arguments")
@@ -155,6 +168,13 @@ public class ExecMojo extends AbstractMojo {
     @Parameter(property = "percolate.exec.skip", defaultValue = "false")
     private boolean skip;
 
+    /**
+     * Maximum time to wait for the forked process to exit, in seconds. Omitted (or non-positive)
+     * means wait indefinitely. On timeout the process is forcibly destroyed and the goal fails.
+     */
+    @Parameter(property = "percolate.exec.timeoutSeconds")
+    private long timeoutSeconds;
+
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
         if (skip) {
@@ -162,11 +182,24 @@ public class ExecMojo extends AbstractMojo {
             return;
         }
 
+        if (mainClass == null || mainClass.isBlank()) {
+            throw new MojoExecutionException("percolate.exec.mainClass must not be blank");
+        }
+        if (rootModule == null || rootModule.isBlank()) {
+            throw new MojoExecutionException("percolate.exec.rootModule must not be blank");
+        }
+        if (!workingDirectory.isDirectory()) {
+            throw new MojoExecutionException(
+                "percolate.exec.workingDirectory does not exist or is not a directory: " + workingDirectory);
+        }
+
         final List<Path> candidates;
         try {
             candidates = resolveCandidates();
         } catch (final DependencyResolutionRequiredException e) {
             throw new MojoExecutionException("Failed to resolve candidates: " + e.getMessage(), e);
+        } catch (final IllegalArgumentException e) {
+            throw new MojoExecutionException(e.getMessage(), e);
         }
 
         getLog().info("classifying " + candidates.size() + " candidates (scope=" + scope + ")");
@@ -188,16 +221,20 @@ public class ExecMojo extends AbstractMojo {
         getLog().info("exec: " + String.join(" ", command));
 
         try {
-            final int exitCode = new ProcessBuilder(command)
+            final Process process = new ProcessBuilder(command)
                 .directory(workingDirectory)
                 .inheritIO()
-                .start()
-                .waitFor();
+                .start();
+
+            final int exitCode = awaitExit(process, timeoutSeconds, rootModule + "/" + mainClass);
             if (exitCode != 0) {
                 throw new MojoFailureException(
                     rootModule + "/" + mainClass + " exited with code " + exitCode);
             }
-        } catch (final IOException | InterruptedException e) {
+        } catch (final InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new MojoExecutionException("exec failed: " + e.getMessage(), e);
+        } catch (final IOException e) {
             throw new MojoExecutionException("exec failed: " + e.getMessage(), e);
         }
     }
@@ -211,14 +248,16 @@ public class ExecMojo extends AbstractMojo {
     }
 
     /**
-     * The JVM flags for the forked process: the whitespace-split {@link #additionalJvmArgsOverride}
-     * when non-blank, else the POM {@link #additionalJvmArgs} list (possibly {@code null}).
+     * The JVM flags for the forked process: {@link #additionalJvmArgsOverride} (or the POM
+     * {@link #additionalJvmArgs} list) followed by the {@code -D} flags forwarded per
+     * {@link #forwardSystemProperties}. Never {@code null}.
      */
     List<String> effectiveJvmArgs() {
-        return ParameterOverrides.resolveEffective(additionalJvmArgsOverride, additionalJvmArgs);
+        return combinedJvmArgs(additionalJvmArgsOverride, additionalJvmArgs,
+            forwardedSystemPropertyArgs(System.getProperties(), forwardSystemProperties));
     }
 
-    private List<Path> resolveCandidates() throws DependencyResolutionRequiredException {
+    List<Path> resolveCandidates() throws DependencyResolutionRequiredException {
         return switch (scope) {
             case "compile" -> toPathList(project.getCompileClasspathElements());
             case "runtime" -> toPathList(project.getRuntimeClasspathElements());
@@ -235,6 +274,70 @@ public class ExecMojo extends AbstractMojo {
 
     private static List<Path> toPathList(final List<String> elements) {
         return elements.stream().map(Path::of).toList();
+    }
+
+    /**
+     * Builds {@code -Dkey=value} flags for every property in {@code properties} whose name starts
+     * with one of {@code prefixes}. Returns an empty, deterministically-ordered list when
+     * {@code prefixes} is null or holds no non-blank entry. Blank prefixes are ignored rather than
+     * treated as a match-everything wildcard, which would forward {@code mvn}'s own built-in
+     * properties.
+     */
+    static List<String> forwardedSystemPropertyArgs(final Properties properties, final List<String> prefixes) {
+        if (prefixes == null) {
+            return List.of();
+        }
+        final List<String> effectivePrefixes = prefixes.stream().filter(p -> !p.isBlank()).toList();
+        if (effectivePrefixes.isEmpty()) {
+            return List.of();
+        }
+        return properties.stringPropertyNames().stream()
+            .filter(name -> effectivePrefixes.stream().anyMatch(name::startsWith))
+            .sorted()
+            .map(name -> "-D" + name + "=" + properties.getProperty(name))
+            .toList();
+    }
+
+    /**
+     * Waits for {@code process} to exit and returns its exit code. A non-positive
+     * {@code timeoutSeconds} waits indefinitely; otherwise, on timeout the process and its
+     * descendants are forcibly destroyed and a {@link MojoExecutionException} is thrown.
+     * <p>
+     * An interrupt while waiting also tears the process tree down before propagating, so a
+     * cancelled build never orphans the fork regardless of which wait branch was taken.
+     */
+    static int awaitExit(final Process process, final long timeoutSeconds, final String label)
+            throws InterruptedException, MojoExecutionException {
+        try {
+            if (timeoutSeconds <= 0) {
+                return process.waitFor();
+            }
+            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                // The goal has already failed and inheritIO() leaves no streams for us to drain.
+                throw new MojoExecutionException(label + " timed out after " + timeoutSeconds + "s");
+            }
+            return process.exitValue();
+        } catch (final MojoExecutionException | InterruptedException e) {
+            // Fire-and-forget: the tree may take a moment to actually die. Kill descendants
+            // first, since destroying only the direct child can orphan them.
+            process.descendants().forEach(ProcessHandle::destroyForcibly);
+            process.destroyForcibly();
+            throw e;
+        }
+    }
+
+    /**
+     * Resolves the JVM-arg override ({@code override}) against the POM list ({@code fromPom}) and
+     * appends {@code forwardedProperties}, in that order. Never returns {@code null}; the result is
+     * a fresh mutable list.
+     */
+    static List<String> combinedJvmArgs(final String override,
+                                        final List<String> fromPom,
+                                        final List<String> forwardedProperties) {
+        final List<String> combined = new ArrayList<>(Objects.requireNonNullElse(
+            ParameterOverrides.resolveEffective(override, fromPom), List.of()));
+        combined.addAll(forwardedProperties);
+        return combined;
     }
 
     static List<String> buildCommand(final String rootModule,
