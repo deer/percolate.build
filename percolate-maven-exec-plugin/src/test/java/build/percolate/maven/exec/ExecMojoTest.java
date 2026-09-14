@@ -7,9 +7,12 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.lang.reflect.Field;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -276,6 +279,52 @@ class ExecMojoTest {
         interrupter.join();
         assertThat(process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
         assertThat(process.isAlive()).isFalse();
+    }
+
+    @Test
+    void awaitExit_outerProcessKilled_killsForkedProcessToo() throws Exception {
+        // Simulates a CI job cancellation that signals only the mvn JVM: run awaitExit in a
+        // separate JVM (standing in for mvn), SIGTERM that JVM the way a cancellation would, and
+        // confirm the shutdown hook it registers reaps the process it forked rather than
+        // orphaning it.
+        final Path pidFile = Files.createTempFile("kill-hook-harness", ".pid");
+        final Process harness = new ProcessBuilder(
+            JAVA_BIN, "-cp", System.getProperty("java.class.path"),
+            KillHookHarness.class.getName(), pidFile.toString())
+            .inheritIO()
+            .start();
+
+        try {
+            final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+            while (Files.readString(pidFile).isBlank() && System.nanoTime() < deadline) {
+                Thread.sleep(20);
+            }
+            final long forkedPid = Long.parseLong(Files.readString(pidFile).trim());
+            assertThat(ProcessHandle.of(forkedPid)).isPresent();
+
+            // Give the harness a moment past writing the pid file to reach the addShutdownHook
+            // call inside awaitExit before it's signalled.
+            Thread.sleep(200);
+            harness.destroy();
+
+            assertThat(harness.waitFor(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(processDiesWithin(forkedPid, TimeUnit.SECONDS.toMillis(10))).isTrue();
+        } finally {
+            harness.destroyForcibly();
+            Files.deleteIfExists(pidFile);
+        }
+    }
+
+    private static boolean processDiesWithin(final long pid, final long timeoutMillis) throws InterruptedException {
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        while (System.nanoTime() < deadline) {
+            final Optional<ProcessHandle> handle = ProcessHandle.of(pid);
+            if (handle.isEmpty() || !handle.get().isAlive()) {
+                return true;
+            }
+            Thread.sleep(50);
+        }
+        return false;
     }
 
     @Test

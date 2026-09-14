@@ -305,25 +305,47 @@ public class ExecMojo extends AbstractMojo {
      * <p>
      * An interrupt while waiting also tears the process tree down before propagating, so a
      * cancelled build never orphans the fork regardless of which wait branch was taken.
+     * <p>
+     * A JVM shutdown hook backs up both of those paths: if the outer (mvn) JVM itself is killed
+     * while we're waiting — e.g. a CI job cancellation signalling only the mvn PID — the hook
+     * reaps the fork instead of leaving it orphaned. It's removed once we're done waiting so it
+     * doesn't outlive this call.
      */
     static int awaitExit(final Process process, final long timeoutSeconds, final String label)
-            throws InterruptedException, MojoExecutionException {
+        throws InterruptedException, MojoExecutionException {
+        final Thread killHook = new Thread(() -> destroyProcessTree(process));
+        Runtime.getRuntime().addShutdownHook(killHook);
         try {
-            if (timeoutSeconds <= 0) {
-                return process.waitFor();
+            try {
+                if (timeoutSeconds <= 0) {
+                    return process.waitFor();
+                }
+                if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                    // The goal has already failed and inheritIO() leaves no streams for us to drain.
+                    throw new MojoExecutionException(label + " timed out after " + timeoutSeconds + "s");
+                }
+                return process.exitValue();
+            } catch (final MojoExecutionException | InterruptedException e) {
+                destroyProcessTree(process);
+                throw e;
             }
-            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
-                // The goal has already failed and inheritIO() leaves no streams for us to drain.
-                throw new MojoExecutionException(label + " timed out after " + timeoutSeconds + "s");
+        } finally {
+            try {
+                Runtime.getRuntime().removeShutdownHook(killHook);
+            } catch (final IllegalStateException ignored) {
+                // JVM shutdown already started concurrently; the hook is about to run (or has
+                // run) regardless, so there's nothing left to clean up.
             }
-            return process.exitValue();
-        } catch (final MojoExecutionException | InterruptedException e) {
-            // Fire-and-forget: the tree may take a moment to actually die. Kill descendants
-            // first, since destroying only the direct child can orphan them.
-            process.descendants().forEach(ProcessHandle::destroyForcibly);
-            process.destroyForcibly();
-            throw e;
         }
+    }
+
+    /**
+     * Fire-and-forget: the tree may take a moment to actually die. Kills descendants first, since
+     * destroying only the direct child can orphan them.
+     */
+    private static void destroyProcessTree(final Process process) {
+        process.descendants().forEach(ProcessHandle::destroyForcibly);
+        process.destroyForcibly();
     }
 
     /**
