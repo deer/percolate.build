@@ -35,6 +35,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
@@ -597,7 +598,30 @@ public final class ModuleGraphClassifier {
         if (name.endsWith(".jar")) {
             name = name.substring(0, name.length() - 4);
         }
-        return name.replaceAll("-(\\d.*)$", "");
+        // The version starts at the earliest token of the final contiguous run of
+        // digit-leading, dash-separated tokens. This handles both an artifactId that itself
+        // contains a "-<digit>" token (log4j-1.2-api-2.17.1.jar: "1.2" and "2.17.1" are
+        // separated by the non-digit token "api", so they're different runs and the *last*
+        // run's start is the true version boundary) and a multi-segment version such as a
+        // timestamped snapshot (foo-1.0-20230101.120000-1.jar: "1.0", "20230101.120000" and
+        // "1" are all digit-leading with nothing non-digit between them, so they form one
+        // run and its *first* token is the true version boundary).
+        final String[] tokens = name.split("-", -1);
+        int lastDigitIndex = -1;
+        for (int i = 1; i < tokens.length; i++) {
+            if (!tokens[i].isEmpty() && Character.isDigit(tokens[i].charAt(0))) {
+                lastDigitIndex = i;
+            }
+        }
+        if (lastDigitIndex < 0) {
+            return name;
+        }
+        int versionStart = lastDigitIndex;
+        while (versionStart > 0 && !tokens[versionStart - 1].isEmpty()
+                && Character.isDigit(tokens[versionStart - 1].charAt(0))) {
+            versionStart--;
+        }
+        return String.join("-", Arrays.copyOfRange(tokens, 0, versionStart));
     }
 
     /**
