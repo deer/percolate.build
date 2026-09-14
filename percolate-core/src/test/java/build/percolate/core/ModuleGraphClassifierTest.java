@@ -73,6 +73,27 @@ class ModuleGraphClassifierTest {
     }
 
     @Test
+    void deriveBaseName_artifactIdContainingEmbeddedVersionLikeToken() {
+        // Regression: artifactId itself contains a "-<digit>" boundary (log4j-1.2-api is a
+        // real Maven artifactId). The non-digit token "api" separates it from the true
+        // version, so "1.2" and "2.17.1" are different digit-leading runs and the *last*
+        // run is the true version boundary — otherwise this collides with the unrelated
+        // "log4j" artifact's base name.
+        assertThat(ModuleGraphClassifier.deriveBaseName(Path.of("log4j-1.2-api-2.17.1.jar")))
+            .isEqualTo("log4j-1.2-api");
+    }
+
+    @Test
+    void deriveBaseName_multiSegmentTimestampedSnapshotVersion() {
+        // Regression: a timestamped SNAPSHOT filename (as resolved from a Maven snapshot
+        // repository) has several digit-leading, dash-separated version segments in a row
+        // with nothing non-digit between them. Unlike the log4j case above, these all belong
+        // to one contiguous run, so the version starts at its *first* token, not its last.
+        assertThat(ModuleGraphClassifier.deriveBaseName(Path.of("foo-1.0-20230101.120000-1.jar")))
+            .isEqualTo("foo");
+    }
+
+    @Test
     void deriveBaseName_null() {
         assertThat(ModuleGraphClassifier.deriveBaseName(null)).isEqualTo("");
     }
