@@ -55,7 +55,7 @@ jobs:
               RELEASE_MAJOR=$MAJOR; RELEASE_MINOR=$((MINOR + 1)); RELEASE_PATCH=0
               ;;
             patch|*)
-              RELEASE_MAJOR=$MAJOR; RELEASE_MINOR=$MINOR; RELEASE_PATCH=$((PATCH + 1))
+              RELEASE_MAJOR=$MAJOR; RELEASE_MINOR=$MINOR; RELEASE_PATCH=$PATCH
               ;;
           esac
 
