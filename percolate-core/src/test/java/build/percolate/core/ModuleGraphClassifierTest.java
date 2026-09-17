@@ -6,6 +6,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.lang.classfile.ClassFile;
 import java.lang.classfile.attribute.ModuleAttribute;
+import java.lang.classfile.attribute.ModulePackagesAttribute;
 import java.lang.constant.ModuleDesc;
 import java.lang.constant.PackageDesc;
 import java.lang.module.Configuration;
@@ -223,6 +224,73 @@ class ModuleGraphClassifierTest {
             });
         assertThat(resolution.demoted()).containsExactly(other);
         assertThat(resolution.superseded()).isEmpty();
+    }
+
+    @Test
+    void resolveConflicts_requiredModulePreference_notBrokenByUnresolvableCandidate() throws IOException {
+        // A poison jar elsewhere in the candidate set must not corrupt the requires closure
+        // used by tier (a) — required should still beat other on its own merits.
+        final Path poison = invalidAutomaticModuleNameJar("lib-utils_1.23-1.0.jar");
+        final Path required = automaticModule("required-1.0.jar", "mod.required", "com/shared/Foo.class");
+        final Path other = automaticModule("other-10.jar", "mod.other", "com/shared/Bar.class");
+        final Path root = properModule("root.jar", "my.root",
+            List.of("mod.required"), "com/root/R.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(poison, root, required, other), Set.of("my.root"), _ -> {
+            });
+        assertThat(resolution.demoted()).containsExactlyInAnyOrder(poison, other);
+        assertThat(resolution.superseded()).isEmpty();
+    }
+
+    @Test
+    void resolveConflicts_privatePackageOverlapBetweenProperModules_isNotATrueConflict() throws IOException {
+        // Two modules that each keep a same-named package private, with no reading
+        // relationship between them, never actually conflict — neither owner is demoted.
+        final Path required = properModuleWithPrivatePackage("required-1.0.jar", "mod.required",
+            List.of(), "com/required/Api.class", "com/shared/internal/Priv.class");
+        final Path other = properModuleWithPrivatePackage("other-1.0.jar", "mod.other",
+            List.of(), "com/other/Api.class", "com/shared/internal/Priv.class");
+        final Path root = properModule("root.jar", "my.root",
+            List.of("mod.required"), "com/root/R.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(root, required, other), Set.of("my.root"), msg -> {
+            });
+        assertThat(resolution.demoted()).isEmpty();
+    }
+
+    @Test
+    void resolveConflicts_qualifiedExportToUnrelatedModule_isNotATrueConflict() throws IOException {
+        // "required" exports com.shared.internal, but only to "mod.unrelated.reader" — a
+        // module that isn't part of this graph at all. Root only reads "required", never
+        // "mod.unrelated.reader", so that export is invisible here. "other"'s own private copy
+        // of the same package name doesn't conflict with it — neither owner is demoted.
+        final Path required = properModuleWithQualifiedExport("required-1.0.jar", "mod.required",
+            "mod.unrelated.reader", "com/shared/internal/Pub.class", "com/required/Extra.class");
+        final Path other = properModuleWithPrivatePackage("other-1.0.jar", "mod.other",
+            List.of(), "com/other/Api.class", "com/shared/internal/Priv.class");
+        final Path root = properModule("root.jar", "my.root",
+            List.of("mod.required"), "com/root/R.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(root, required, other), Set.of("my.root"), msg -> {
+            });
+        assertThat(resolution.demoted()).isEmpty();
+    }
+
+    @Test
+    void resolveConflicts_privatePackageThatReadsAnExportingModule_isATrueConflict() throws IOException {
+        // "other" keeps its own copy of com.shared.internal private, but requires "required",
+        // which exports that same package to it — a genuine conflict. Tier (a) demotes the
+        // non-required owner ("other").
+        final Path required = properModule("required-1.0.jar", "mod.required",
+            List.of(), "com/shared/internal/Pub.class", "com/required/Extra.class");
+        final Path other = properModuleWithPrivatePackage("other-1.0.jar", "mod.other",
+            List.of("mod.required"), "com/other/Api.class", "com/shared/internal/Priv.class");
+        final Path root = properModule("root.jar", "my.root",
+            List.of("mod.required"), "com/root/R.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(root, required, other), Set.of("my.root"), msg -> {
+            });
+        assertThat(resolution.demoted()).containsExactly(other);
     }
 
     @Test
@@ -495,6 +563,34 @@ class ModuleGraphClassifierTest {
     }
 
     @Test
+    void resolveConflicts_unresolvableDescriptorJarIsForcedToClassPath() throws IOException {
+        // An invalid Automatic-Module-Name (e.g. a hyphenated/underscored segment that isn't a
+        // valid Java identifier) must be demoted up front instead of silently left on the
+        // module path, where it would only fail later during Configuration#resolve.
+        final Path broken = invalidAutomaticModuleNameJar("lib-utils_1.23-1.0.jar");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(broken), Set.of(), _ -> {
+            });
+        assertThat(resolution.demoted()).containsExactly(broken);
+    }
+
+    @Test
+    void classifyAndResolve_unresolvableDescriptorJarPresent_doesNotPoisonResolution() throws IOException {
+        // End-to-end: the same unresolvable-descriptor jar must not crash Configuration#resolve
+        // (the bug this guards against) — it should be classified onto the classpath, and the
+        // rest of the graph should resolve normally.
+        final Path broken = invalidAutomaticModuleNameJar("lib-utils_1.23-1.0.jar");
+        final Path root = automaticModule("root.jar", "my.root", "com/root/R.class");
+        final var result = ModuleGraphClassifier.classifyAndResolve(
+            List.of(root, broken), Set.of("my.root"), "my.root",
+            Configuration.empty(), ModuleFinder.ofSystem(), _ -> {
+            }
+        );
+        assertThat(result.modulePath()).containsExactly(root);
+        assertThat(result.classPath()).containsExactly(broken);
+    }
+
+    @Test
     void classifyAndResolve_unresolvableRoot_throwsIllegalState() throws IOException {
         final Path dep = automaticModule("dep.jar", "mod.dep", "com/dep/D.class");
         assertThatThrownBy(() -> ModuleGraphClassifier.classifyAndResolve(
@@ -597,6 +693,20 @@ class ModuleGraphClassifierTest {
     }
 
     @Test
+    void closeOverRequires_unresolvableDescriptorJarTruncatesClosure() throws IOException {
+        // A poison jar elsewhere in the candidate set is filtered out before the finder is
+        // built, so it can't block the scan for "mod.root" — the closure still reaches
+        // "mod.leaf" through mod.root's requires.
+        final Path poison = invalidAutomaticModuleNameJar("lib-utils_1.23-1.0.jar");
+        final Path leaf = automaticModule("leaf.jar", "mod.leaf", "com/leaf/L.class");
+        final Path root = properModule("root.jar", "mod.root",
+            List.of("mod.leaf"), "com/root/R.class");
+        final Set<String> required = ModuleGraphClassifier.closeOverRequires(
+            List.of(poison, root, leaf), Set.of("mod.root"));
+        assertThat(required).contains("mod.root", "mod.leaf");
+    }
+
+    @Test
     void closeOverRequires_unresolvableNameStillRecorded() throws IOException {
         // A name not in the finder is still recorded — that's how the classifier's tier (a)
         // protection works for modules that sit alongside a split-package sibling.
@@ -604,6 +714,20 @@ class ModuleGraphClassifierTest {
         final Set<String> required = ModuleGraphClassifier.closeOverRequires(
             List.of(any), Set.of("mod.ghost"));
         assertThat(required).contains("mod.ghost");
+    }
+
+    // =========================================================================
+    // parseSourceRequires — module-info.java text parsing
+    // =========================================================================
+
+    @Test
+    void parseSourceRequires_moduleNameWithDollarSign_isCapturedInFull() throws IOException {
+        // '$' is a legal identifier character in a module name (JLS 3.8), so a "requires"
+        // directive using one is captured with the name intact.
+        final Path moduleInfo = this.tempDir.resolve("module-info.java");
+        Files.writeString(moduleInfo, "module my.root { requires foo.ba$r; }");
+        final Set<String> names = ModuleGraphClassifier.parseSourceRequires(moduleInfo);
+        assertThat(names).containsExactly("foo.ba$r");
     }
 
     // =========================================================================
@@ -636,6 +760,18 @@ class ModuleGraphClassifierTest {
         return jar;
     }
 
+    private Path invalidAutomaticModuleNameJar(final String fileName) throws IOException {
+        final Path jar = this.tempDir.resolve(fileName);
+        final Manifest manifest = new Manifest();
+        manifest.getMainAttributes().put(Attributes.Name.MANIFEST_VERSION, "1.0");
+        manifest.getMainAttributes().putValue("Automatic-Module-Name", "com.acme.lib-utils_1.23");
+        try (var jos = new JarOutputStream(Files.newOutputStream(jar), manifest)) {
+            jos.putNextEntry(new JarEntry("com/acme/lib/Foo.class"));
+            jos.closeEntry();
+        }
+        return jar;
+    }
+
     private Path properModule(final String fileName,
                               final String moduleName,
                               final List<String> requiresModules,
@@ -664,6 +800,71 @@ class ModuleGraphClassifierTest {
                 jos.putNextEntry(new JarEntry(entry));
                 jos.closeEntry();
             }
+        }
+        return jar;
+    }
+
+    private Path properModuleWithQualifiedExport(final String fileName,
+                                                 final String moduleName,
+                                                 final String qualifiedTargetModule,
+                                                 final String qualifiedClassEntry,
+                                                 final String unqualifiedClassEntry) throws IOException {
+        final String qualifiedPkg = packagesOf(new String[]{qualifiedClassEntry}).iterator().next();
+        final String unqualifiedPkg = packagesOf(new String[]{unqualifiedClassEntry}).iterator().next();
+        final byte[] moduleInfoBytes = ClassFile.of().buildModule(
+            ModuleAttribute.of(
+                ModuleDesc.of(moduleName),
+                mb -> {
+                    mb.requires(ModuleDesc.of("java.base"), 0, null);
+                    mb.exports(PackageDesc.of(qualifiedPkg), 0, ModuleDesc.of(qualifiedTargetModule));
+                    mb.exports(PackageDesc.of(unqualifiedPkg), 0);
+                }));
+
+        final Path jar = this.tempDir.resolve(fileName);
+        try (JarOutputStream jos = new JarOutputStream(Files.newOutputStream(jar))) {
+            jos.putNextEntry(new JarEntry("module-info.class"));
+            jos.write(moduleInfoBytes);
+            jos.closeEntry();
+            jos.putNextEntry(new JarEntry(qualifiedClassEntry));
+            jos.closeEntry();
+            jos.putNextEntry(new JarEntry(unqualifiedClassEntry));
+            jos.closeEntry();
+        }
+        return jar;
+    }
+
+    private Path properModuleWithPrivatePackage(final String fileName,
+                                                final String moduleName,
+                                                final List<String> requiresModules,
+                                                final String exportedClassEntry,
+                                                final String privateClassEntry) throws IOException {
+        final String exportedPkg = packagesOf(new String[]{exportedClassEntry}).iterator().next();
+        final String privatePkg = packagesOf(new String[]{privateClassEntry}).iterator().next();
+        final byte[] moduleInfoBytes = ClassFile.of().buildModule(
+            ModuleAttribute.of(
+                ModuleDesc.of(moduleName),
+                mb -> {
+                    mb.requires(ModuleDesc.of("java.base"), 0, null);
+                    for (final String req : requiresModules) {
+                        mb.requires(ModuleDesc.of(req), 0, null);
+                    }
+                    mb.exports(PackageDesc.of(exportedPkg), 0);
+                }),
+            // A real javac-compiled module-info always lists every package it contains here,
+            // exported or not (JVMS 4.7.26); include the private one too so ModuleFinder
+            // reports it via ModuleDescriptor#packages() just like a real jar would.
+            classBuilder -> classBuilder.with(
+                ModulePackagesAttribute.ofNames(PackageDesc.of(exportedPkg), PackageDesc.of(privatePkg))));
+
+        final Path jar = this.tempDir.resolve(fileName);
+        try (JarOutputStream jos = new JarOutputStream(Files.newOutputStream(jar))) {
+            jos.putNextEntry(new JarEntry("module-info.class"));
+            jos.write(moduleInfoBytes);
+            jos.closeEntry();
+            jos.putNextEntry(new JarEntry(exportedClassEntry));
+            jos.closeEntry();
+            jos.putNextEntry(new JarEntry(privateClassEntry));
+            jos.closeEntry();
         }
         return jar;
     }

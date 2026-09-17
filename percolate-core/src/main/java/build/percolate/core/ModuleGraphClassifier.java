@@ -49,6 +49,7 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 /**
  * Unified JPMS module-graph classifier. Given a flat list of candidate jars (or exploded
@@ -99,10 +100,14 @@ import java.util.regex.Pattern;
  *
  * <p>Candidates that don't own any package at all (unreadable jars, empty directories) fall
  * through unchanged — they're routed to the module-path bucket where filename-based automatic
- * module discovery can still pick them up. Two proper JPMS modules sharing a real package
- * can't be silently resolved — tier (b) would keep both and tier (c) fires, demoting neither,
- * leaving JPMS to report a genuine split-package error. That's intentional: two proper
- * modules with a real conflict represent a broken dependency graph.
+ * module discovery can still pick them up. This is distinct from a candidate whose descriptor
+ * the finder recognises but can't derive (e.g. an invalid {@code Automatic-Module-Name}) —
+ * those are force-demoted to classpath up front, since leaving them on the module path would
+ * only defer the same failure to {@link Configuration#resolve} at {@link #classifyAndResolve}
+ * time. Two proper JPMS modules sharing a real package can't be silently resolved — tier (b)
+ * would keep both and tier (c) fires, demoting neither, leaving JPMS to report a genuine
+ * split-package error. That's intentional: two proper modules with a real conflict represent
+ * a broken dependency graph.
  *
  * <h2>Entry points</h2>
  *
@@ -283,13 +288,22 @@ public final class ModuleGraphClassifier {
      * sits alongside a split-package sibling in the candidate set — what matters for the
      * split-package decision is whether the <em>name</em> is transitively required, not
      * whether we can walk through its descriptor.
+     *
+     * <p>Candidates with an unresolvable descriptor (see {@link #probeDescriptor}, e.g. an
+     * invalid {@code Automatic-Module-Name}) are filtered out before the finder is built. A
+     * finder that still contained one could throw while scanning for an unrelated name — one
+     * bad jar anywhere in {@code candidates} would then silently truncate the closure before it
+     * ever reached the name actually being looked for, regardless of which name was queried.
      */
     public static Set<String> closeOverRequires(final List<Path> candidates,
                                                 final Set<String> seedNames) {
         if (seedNames.isEmpty()) {
             return Set.of();
         }
-        final ModuleFinder finder = ModuleFinder.of(candidates.toArray(new Path[0]));
+        final List<Path> resolvableCandidates = candidates.stream()
+            .filter(p -> !probeDescriptor(p).unresolvable())
+            .toList();
+        final ModuleFinder finder = ModuleFinder.of(resolvableCandidates.toArray(new Path[0]));
         final Set<String> visited = new LinkedHashSet<>();
         final Deque<String> frontier = new ArrayDeque<>(seedNames);
         while (!frontier.isEmpty()) {
@@ -305,7 +319,7 @@ public final class ModuleGraphClassifier {
                         }
                     }
                 });
-            } catch (final FindException e) {
+            } catch (final FindException | IllegalArgumentException e) {
                 // module directory exists but is partially written by a concurrent compilation; skip
             }
         }
@@ -340,7 +354,7 @@ public final class ModuleGraphClassifier {
     }
 
     private static final Pattern REQUIRES_PATTERN = Pattern.compile(
-        "\\brequires\\s+(?:(?:static|transitive)\\s+){0,2}([\\w.]+)\\s*;");
+        "\\brequires\\s+(?:(?:static|transitive)\\s+){0,2}([\\p{L}\\p{N}_$.]+)\\s*;");
 
     /**
      * Parse the {@code requires} directives from a source {@code module-info.java} file.
@@ -380,7 +394,12 @@ public final class ModuleGraphClassifier {
      * (scanned from {@code .class} entries), and filename-derived automatic modules
      * (same scan). Candidates that the finder can't interpret as modules at all — e.g.
      * unreadable jars, directories with no classes — contribute no packages and so are
-     * silently excluded from conflict analysis.
+     * silently excluded from conflict analysis. Candidates whose descriptor the finder
+     * recognises but can't derive (e.g. an invalid {@code Automatic-Module-Name}) are handled
+     * separately: they're force-demoted up front (see {@link #probeDescriptor}) rather than
+     * left on the module path, where {@link Configuration#resolve} would later hit the same
+     * failure uncaught. The already-probed resolvable paths are reused (rather than re-probed)
+     * when seeding {@link #closeOverRequires} for tier (a).
      */
     public static ConflictResolution resolveConflicts(final List<Path> candidates,
                                                       final Set<String> seedRequiredNames,
@@ -391,8 +410,17 @@ public final class ModuleGraphClassifier {
         // finder — we still record both and let them conflict normally.
         final Map<Path, ModuleDescriptor> descriptorsByPath = new LinkedHashMap<>();
         final Map<Path, Set<String>> packagesByPath = new LinkedHashMap<>();
+        final Set<Path> superseded = new HashSet<>();
+        final Set<Path> demoted = new HashSet<>();
         for (final Path path : candidates) {
-            final ModuleDescriptor descriptor = readDescriptor(path);
+            final DescriptorProbe probe = probeDescriptor(path);
+            if (probe.unresolvable()) {
+                log.accept(String.format(
+                    "Unresolvable module descriptor for [%s] — forcing to classpath", path.getFileName()));
+                demoted.add(path);
+                continue;
+            }
+            final ModuleDescriptor descriptor = probe.descriptor();
             if (descriptor == null) {
                 continue;
             }
@@ -402,6 +430,16 @@ public final class ModuleGraphClassifier {
             }
         }
 
+        // A qualified export ("exports p to X") only reaches module X, so it's only visible in
+        // this graph if X is one of the other candidates. Computed once all descriptors are
+        // known so a candidate earlier in the list can be recognised as a valid target too.
+        final Set<String> candidateModuleNames = descriptorsByPath.values().stream()
+            .map(ModuleDescriptor::name)
+            .collect(Collectors.toUnmodifiableSet());
+        final Map<Path, Set<String>> exportedPackagesByPath = new LinkedHashMap<>();
+        packagesByPath.forEach((path, ignored) ->
+            exportedPackagesByPath.put(path, exportedPackages(descriptorsByPath.get(path), candidateModuleNames)));
+
         // invert: package → owners
         final Map<String, List<Path>> packageOwners = new HashMap<>();
         packagesByPath.forEach((path, packages) -> {
@@ -410,23 +448,30 @@ public final class ModuleGraphClassifier {
             }
         });
 
-        // collect contested packages
+        // collect contested packages. A shared package is only a real conflict if at least one
+        // owner actually exports it — Configuration#resolve only rejects a split package that's
+        // exported to a common reader, or contained by a module that reads an exporter of it.
+        // Two modules that each keep a same-named package private never conflict at all, no
+        // matter how they're wired together, so they're excluded here rather than left for the
+        // tiered demotion policy below to (incorrectly) treat as genuine.
         final Map<String, List<Path>> conflicts = new HashMap<>();
         packageOwners.forEach((pkg, owners) -> {
-            if (owners.size() > 1) {
+            if (owners.size() > 1
+                && owners.stream().anyMatch(p -> exportedPackagesByPath.getOrDefault(p, Set.of()).contains(pkg))) {
                 conflicts.put(pkg, owners);
             }
         });
-
-        final Set<Path> superseded = new HashSet<>();
-        final Set<Path> demoted = new HashSet<>();
 
         if (conflicts.isEmpty()) {
             return new ConflictResolution(superseded, demoted);
         }
 
-        // transitive requires closure for tier (a) of split-package resolution
-        final Set<String> requiredNames = closeOverRequires(candidates, seedRequiredNames);
+        // transitive requires closure for tier (a) of split-package resolution. Pass the
+        // already-probed resolvable paths rather than the raw candidate list — closeOverRequires
+        // filters internally too (it has to, for callers that haven't already done this work),
+        // but re-probing paths we've just probed above would re-parse every jar a second time.
+        final Set<String> requiredNames = closeOverRequires(
+            new ArrayList<>(descriptorsByPath.keySet()), seedRequiredNames);
 
         // -- Version dedupe: group all conflicting jars by base name, keep newest
         final Set<Path> allConflicting = new HashSet<>();
@@ -508,25 +553,24 @@ public final class ModuleGraphClassifier {
                 }
             }
 
-            // tier (b): proper modules win over automatic
-            final boolean hasProperModule = owners.stream().anyMatch(p -> {
-                final ModuleDescriptor d = descriptorsByPath.get(p);
-                return d != null && !d.isAutomatic();
-            });
-            if (!hasProperModule) {
+            // tier (b): proper modules win over automatic. Partition once into proper vs
+            // automatic owners, rather than walking `owners` again per branch below.
+            final List<Path> properOwners = new ArrayList<>();
+            final List<Path> automaticOwners = new ArrayList<>();
+            for (final Path owner : owners) {
+                final ModuleDescriptor d = descriptorsByPath.get(owner);
+                if (d != null && !d.isAutomatic()) {
+                    properOwners.add(owner);
+                } else {
+                    automaticOwners.add(owner);
+                }
+            }
+            if (properOwners.isEmpty()) {
                 // tier (c): no proper module among the owners — nothing to prefer, demote all
                 log.accept(String.format("  no proper module among owners, demoting all %s",
                     owners.stream().map(p -> p.getFileName().toString()).toList()));
                 demoted.addAll(owners);
                 continue;
-            }
-            final List<Path> automaticOwners = new ArrayList<>();
-            for (final Path owner : owners) {
-                final ModuleDescriptor d = descriptorsByPath.get(owner);
-                final boolean isProper = d != null && !d.isAutomatic();
-                if (!isProper) {
-                    automaticOwners.add(owner);
-                }
             }
             if (automaticOwners.isEmpty()) {
                 // every owner is a proper module — none can be preferred over another;
@@ -541,11 +585,10 @@ public final class ModuleGraphClassifier {
                     owner.getFileName()));
                 demoted.add(owner);
             }
-            final long remainingProperOwners = owners.size() - automaticOwners.size();
-            if (remainingProperOwners > 1) {
+            if (properOwners.size() > 1) {
                 log.accept(String.format(
                     "  %d proper modules still conflict on [%s] after demoting automatics — leaving for JPMS to reject",
-                    remainingProperOwners, entry.getKey()));
+                    properOwners.size(), entry.getKey()));
             }
         }
 
@@ -563,17 +606,63 @@ public final class ModuleGraphClassifier {
      * etc.).
      */
     public static ModuleDescriptor readDescriptor(final Path path) {
+        return probeDescriptor(path).descriptor();
+    }
+
+    /**
+     * Result of {@link #probeDescriptor}: either a resolved {@code descriptor} (possibly
+     * {@code null} if the path isn't a module at all), or {@code unresolvable} set when the
+     * finder recognised a module-defining attribute (e.g. {@code Automatic-Module-Name}) but
+     * couldn't derive a descriptor from it — in that case {@code descriptor} is always
+     * {@code null}.
+     */
+    private record DescriptorProbe(ModuleDescriptor descriptor,
+                                   boolean unresolvable) {
+    }
+
+    /**
+     * Backs {@link #readDescriptor} (which only wants the descriptor, or {@code null}) and
+     * every internal caller that additionally needs to distinguish "not a module at all" — no
+     * descriptor, nothing wrong — from "looks like a module but the descriptor can't be
+     * derived", e.g. an invalid {@code Automatic-Module-Name} or a malformed multi-release jar.
+     * The latter is reported via {@code unresolvable} so callers can exclude or force-demote
+     * that candidate instead of silently leaving it in a raw {@link ModuleFinder}, where a
+     * later {@link Configuration#resolve} (or, in {@link #closeOverRequires}, an unrelated
+     * {@code finder.find} lookup) would hit the same failure.
+     */
+    private static DescriptorProbe probeDescriptor(final Path path) {
         if (path == null || !Files.exists(path)) {
-            return null;
+            return new DescriptorProbe(null, false);
         }
         try {
-            return ModuleFinder.of(path).findAll().stream()
+            final var descriptor = ModuleFinder.of(path).findAll().stream()
                 .findFirst()
                 .map(ModuleReference::descriptor)
                 .orElse(null);
+            return new DescriptorProbe(descriptor, false);
         } catch (final FindException | IllegalArgumentException e) {
-            return null;
+            return new DescriptorProbe(null, true);
         }
+    }
+
+    /**
+     * Returns the packages {@code descriptor} exports and are actually visible somewhere in
+     * this candidate graph. An automatic module has no {@code exports} directives of its own
+     * but is treated by the JPMS runtime as exporting every package it contains, so its full
+     * {@link ModuleDescriptor#packages()} is returned. A proper module contributes an unqualified
+     * export unconditionally, but a qualified export ({@code exports p to X}) only if {@code X}
+     * is one of {@code candidateModuleNames} — a qualified export naming some module outside
+     * this graph can never actually be read by anything here, so it can't be a real conflict.
+     */
+    private static Set<String> exportedPackages(final ModuleDescriptor descriptor,
+                                                final Set<String> candidateModuleNames) {
+        if (descriptor.isAutomatic()) {
+            return descriptor.packages();
+        }
+        return descriptor.exports().stream()
+            .filter(e -> !e.isQualified() || e.targets().stream().anyMatch(candidateModuleNames::contains))
+            .map(ModuleDescriptor.Exports::source)
+            .collect(Collectors.toUnmodifiableSet());
     }
 
     /**
@@ -618,7 +707,7 @@ public final class ModuleGraphClassifier {
         }
         int versionStart = lastDigitIndex;
         while (versionStart > 0 && !tokens[versionStart - 1].isEmpty()
-                && Character.isDigit(tokens[versionStart - 1].charAt(0))) {
+            && Character.isDigit(tokens[versionStart - 1].charAt(0))) {
             versionStart--;
         }
         return String.join("-", Arrays.copyOfRange(tokens, 0, versionStart));
