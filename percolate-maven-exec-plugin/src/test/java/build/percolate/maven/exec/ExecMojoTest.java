@@ -6,6 +6,7 @@ import org.apache.maven.plugin.logging.SystemStreamLog;
 import org.junit.jupiter.api.Test;
 
 import java.io.File;
+import java.lang.module.ModuleFinder;
 import java.lang.reflect.Field;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -116,6 +117,31 @@ class ExecMojoTest {
 
         assertThat(command).containsExactly(
             JAVA_BIN, "-m", "root.module/root.Main", "--flag", "value");
+    }
+
+    @Test
+    void requireResolvableModulePath_nonEmptyModulePath_neverThrows() {
+        final ModuleGraphClassifier.Classification classification = new ModuleGraphClassifier.Classification(
+            List.of(Path.of("/deps/a.jar")), List.of());
+
+        assertThatCode(() -> ExecMojo.requireResolvableModulePath(
+            "does.not.exist.anywhere", classification, ModuleFinder.of()))
+            .doesNotThrowAnyException();
+    }
+
+    @Test
+    void requireResolvableModulePath_emptyModulePathAndSystemModule_doesNotThrow() {
+        assertThatCode(() -> ExecMojo.requireResolvableModulePath(
+            "java.base", EMPTY, ModuleFinder.ofSystem()))
+            .doesNotThrowAnyException();
+    }
+
+    @Test
+    void requireResolvableModulePath_emptyModulePathAndUnknownModule_throws() {
+        assertThatThrownBy(() -> ExecMojo.requireResolvableModulePath(
+            "does.not.exist.anywhere", EMPTY, ModuleFinder.of()))
+            .isInstanceOf(MojoExecutionException.class)
+            .hasMessageContaining("does.not.exist.anywhere");
     }
 
     @Test

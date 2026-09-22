@@ -247,6 +247,8 @@ public class ExecMojo extends AbstractMojo {
         getLog().info("module-path=" + classification.modulePath().size()
             + " class-path=" + classification.classPath().size());
 
+        requireResolvableModulePath(rootModule, classification, ModuleFinder.ofSystem());
+
         final List<String> command = buildCommand(
             rootModule, mainClass, maxHeap, effectiveJvmArgs(), effectiveArguments(), classification);
         getLog().info("exec: " + String.join(" ", command));
@@ -299,6 +301,29 @@ public class ExecMojo extends AbstractMojo {
                 .map(File::toPath)
                 .toList();
         };
+    }
+
+    /**
+     * Guards against an empty {@code classification.modulePath()}: with no jars on the
+     * module-path, {@code -m rootModuleName/mainClass} can only resolve if {@code rootModuleName}
+     * is itself a module supplied by the JDK, since that's the only other source {@code java -m}
+     * consults. {@code systemModuleFinder} is that source of JDK modules — {@link
+     * ModuleFinder#ofSystem()} in production, passed in here so tests can substitute their own.
+     * Anything else means the classification produced nothing usable and the fork would fail
+     * immediately with an opaque JPMS resolution error, so this fails fast with a clearer one
+     * instead.
+     */
+    static void requireResolvableModulePath(final String rootModuleName,
+                                            final ModuleGraphClassifier.Classification classification,
+                                            final ModuleFinder systemModuleFinder) throws MojoExecutionException {
+        if (!classification.modulePath().isEmpty() || systemModuleFinder.find(rootModuleName).isPresent()) {
+            return;
+        }
+        throw new MojoExecutionException(
+            "No candidate jars were classified onto --module-path for root module [" + rootModuleName
+                + "], and it is not a JDK module either. The forked \"-m " + rootModuleName
+                + "/...\" launch would fail to resolve; check percolate.exec.scope and the "
+                + "candidates' module-info / Automatic-Module-Name.");
     }
 
     private static List<Path> toPathList(final List<String> elements) {
