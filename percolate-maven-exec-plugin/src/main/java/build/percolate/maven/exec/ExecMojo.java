@@ -205,7 +205,7 @@ public class ExecMojo extends AbstractMojo {
      * Maximum time to wait for the forked process to exit, in seconds. Omitted (or non-positive)
      * means wait indefinitely. On timeout the process is forcibly destroyed and the goal fails.
      */
-    @Parameter(property = "percolate.exec.timeoutSeconds")
+    @Parameter(property = "percolate.exec.timeoutSeconds", defaultValue = "0")
     private long timeoutSeconds;
 
     @Override
