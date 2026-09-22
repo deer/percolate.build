@@ -198,14 +198,16 @@ abstract class AbstractClassifyPathMojo extends AbstractMojo {
         final List<String> explicitSeed = ParameterOverrides.resolveEffective(seedModulesOverride, seedModules);
         if (explicitSeed != null && !explicitSeed.isEmpty()) {
             return ModuleGraphClassifier.closeOverRequires(
-                candidates, new LinkedHashSet<>(explicitSeed));
+                candidates, new LinkedHashSet<>(explicitSeed),
+                msg -> getLog().info("[classify] " + msg));
         }
 
         // 2. Source module-info.java, if present
         final Optional<Path> moduleInfo = getSourceModuleInfo();
         if (moduleInfo.isPresent()) {
             final Set<String> fromSource =
-                ModuleGraphClassifier.collectRequiredModuleNames(moduleInfo, candidates);
+                ModuleGraphClassifier.collectRequiredModuleNames(moduleInfo, candidates,
+                    msg -> getLog().info("[classify] " + msg));
             if (!fromSource.isEmpty()) {
                 return fromSource;
             }
@@ -231,7 +233,8 @@ abstract class AbstractClassifyPathMojo extends AbstractMojo {
             }
         }
         if (!directDepNames.isEmpty()) {
-            return ModuleGraphClassifier.closeOverRequires(candidates, directDepNames);
+            return ModuleGraphClassifier.closeOverRequires(candidates, directDepNames,
+                msg -> getLog().info("[classify] " + msg));
         }
 
         // 4. Empty fallback — tier (a) will not fire
