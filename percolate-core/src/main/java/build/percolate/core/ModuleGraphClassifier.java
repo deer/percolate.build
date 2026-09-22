@@ -294,9 +294,15 @@ public final class ModuleGraphClassifier {
      * finder that still contained one could throw while scanning for an unrelated name — one
      * bad jar anywhere in {@code candidates} would then silently truncate the closure before it
      * ever reached the name actually being looked for, regardless of which name was queried.
+     *
+     * @param log per-decision log sink; called only if a candidate that passed the initial
+     *            per-path probe above still throws once the aggregated finder actually scans it
+     *            (e.g. a directory that started being overwritten by a concurrent compilation in
+     *            between). Callers that don't need this diagnosability may pass a no-op consumer.
      */
     public static Set<String> closeOverRequires(final List<Path> candidates,
-                                                final Set<String> seedNames) {
+                                                final Set<String> seedNames,
+                                                final Consumer<String> log) {
         if (seedNames.isEmpty()) {
             return Set.of();
         }
@@ -320,7 +326,11 @@ public final class ModuleGraphClassifier {
                     }
                 });
             } catch (final FindException | IllegalArgumentException e) {
-                // module directory exists but is partially written by a concurrent compilation; skip
+                log.accept(String.format(
+                    "Requires-closure lookup for [%s] failed after passing the initial probe (%s) — "
+                        + "treating as a dead end; the transitive closure may be missing names reachable "
+                        + "only through it",
+                    name, e.getMessage()));
             }
         }
         return visited;
@@ -337,12 +347,14 @@ public final class ModuleGraphClassifier {
      * @param sourceModuleInfoJava the source {@code module-info.java}, or empty for
      *                             non-modular compilation (returns an empty set)
      * @param candidates           compile-time classpath jars / directories to walk
+     * @param log                  per-decision log sink, forwarded to {@link #closeOverRequires}
      * @return the set of module names the root transitively requires, or an empty set if
      * the source file is missing, unreadable, or declares no {@code requires}
      */
     public static Set<String> collectRequiredModuleNames(
         final Optional<Path> sourceModuleInfoJava,
-        final List<Path> candidates) {
+        final List<Path> candidates,
+        final Consumer<String> log) {
         if (sourceModuleInfoJava.isEmpty()) {
             return Set.of();
         }
@@ -350,7 +362,7 @@ public final class ModuleGraphClassifier {
         if (direct.isEmpty()) {
             return Set.of();
         }
-        return closeOverRequires(candidates, direct);
+        return closeOverRequires(candidates, direct, log);
     }
 
     private static final Pattern REQUIRES_PATTERN = Pattern.compile(
@@ -471,9 +483,18 @@ public final class ModuleGraphClassifier {
         // filters internally too (it has to, for callers that haven't already done this work),
         // but re-probing paths we've just probed above would re-parse every jar a second time.
         final Set<String> requiredNames = closeOverRequires(
-            new ArrayList<>(descriptorsByPath.keySet()), seedRequiredNames);
+            new ArrayList<>(descriptorsByPath.keySet()), seedRequiredNames, log);
 
-        // -- Version dedupe: group all conflicting jars by base name, keep newest
+        // -- Version dedupe: group all conflicting jars by base name, keep newest — unless a
+        // group member is required by name AND the survivor doesn't itself provide that name.
+        // Grouping is purely by filename base name, not module identity, so two unrelated
+        // modules can coincidentally share a base name; in that case the required module must
+        // survive this pass to be weighed by tier (a) below instead of being dropped outright
+        // here. But when the survivor genuinely is the same module (identical declared name,
+        // just a different version) — the common case — dropping the older duplicate is always
+        // safe: the kept jar satisfies the exact same `requires` on its own, so the required-name
+        // check must not block that, or a real version duplicate of a required module would stop
+        // being deduped at all and both copies would fall through to an unwinnable tier (a) tie.
         final Set<Path> allConflicting = new HashSet<>();
         conflicts.values().forEach(allConflicting::addAll);
 
@@ -486,16 +507,35 @@ public final class ModuleGraphClassifier {
             if (group.size() > 1) {
                 group.sort(jarVersionDescending());
                 final Path kept = group.get(0);
+                final ModuleDescriptor descriptorKept = descriptorsByPath.get(kept);
+                final String nameKept = descriptorKept == null ? "" : descriptorKept.name();
                 for (int i = 1; i < group.size(); i++) {
+                    final Path candidate = group.get(i);
+                    final ModuleDescriptor descriptorCandidate = descriptorsByPath.get(candidate);
+                    final String nameCandidate = descriptorCandidate == null ? "" : descriptorCandidate.name();
+                    final boolean sameModuleAsKept = !nameCandidate.isEmpty() && nameCandidate.equals(nameKept);
+                    if (!sameModuleAsKept && requiredNames.contains(nameCandidate)) {
+                        log.accept(String.format(
+                            "  [%s] looks like a version duplicate superseded by [%s] but is explicitly "
+                                + "required by name — keeping for tier (a) instead of dropping",
+                            candidate.getFileName(), kept.getFileName()));
+                        continue;
+                    }
                     log.accept(String.format(
                         "Version duplicate [%s] superseded by [%s] — dropping",
-                        group.get(i).getFileName(), kept.getFileName()));
-                    superseded.add(group.get(i));
+                        candidate.getFileName(), kept.getFileName()));
+                    superseded.add(candidate);
                 }
             }
         }
 
-        // -- Subset dedupe: if A's packages ⊂ B's, supersede A
+        // -- Subset dedupe: if A's packages ⊂ B's, supersede A — unless A is required by name
+        // AND every qualifying superset is a genuinely different module from A (the same
+        // reasoning as version dedupe above: if some superset already is the required module,
+        // dropping A is always safe). `remaining` is a LinkedHashSet built from a HashSet, so its
+        // iteration order is not meaningful — when A has more than one qualifying superset, a
+        // same-module one must always be preferred over a different-module one regardless of
+        // which is encountered first, or this pass would become order-dependent on Path#hashCode.
         final Set<Path> remaining = new LinkedHashSet<>(allConflicting);
         remaining.removeAll(superseded);
         for (final Path a : new ArrayList<>(remaining)) {
@@ -503,19 +543,47 @@ public final class ModuleGraphClassifier {
                 continue;
             }
             final Set<String> pkgsA = packagesByPath.getOrDefault(a, Set.of());
+            final ModuleDescriptor descriptorA = descriptorsByPath.get(a);
+            final String nameA = descriptorA == null ? "" : descriptorA.name();
+
+            final List<Path> supersets = new ArrayList<>();
             for (final Path b : remaining) {
                 if (a.equals(b) || superseded.contains(b)) {
                     continue;
                 }
                 final Set<String> pkgsB = packagesByPath.getOrDefault(b, Set.of());
                 if (pkgsB.containsAll(pkgsA) && pkgsB.size() > pkgsA.size()) {
-                    log.accept(String.format(
-                        "Subset jar [%s] (%d pkgs) subsumed by [%s] (%d pkgs) — dropping",
-                        a.getFileName(), pkgsA.size(), b.getFileName(), pkgsB.size()));
-                    superseded.add(a);
+                    supersets.add(b);
+                }
+            }
+            if (supersets.isEmpty()) {
+                continue;
+            }
+
+            Path sameModuleSuperset = null;
+            for (final Path b : supersets) {
+                final ModuleDescriptor descriptorB = descriptorsByPath.get(b);
+                final String nameB = descriptorB == null ? "" : descriptorB.name();
+                if (!nameA.isEmpty() && nameA.equals(nameB)) {
+                    sameModuleSuperset = b;
                     break;
                 }
             }
+
+            if (sameModuleSuperset == null && requiredNames.contains(nameA)) {
+                log.accept(String.format(
+                    "  [%s] looks like a package subset of %s but is explicitly required by "
+                        + "name — keeping for tier (a) instead of dropping",
+                    a.getFileName(), supersets.stream().map(p -> p.getFileName().toString()).toList()));
+                continue;
+            }
+
+            final Path kept = sameModuleSuperset != null ? sameModuleSuperset : supersets.get(0);
+            log.accept(String.format(
+                "Subset jar [%s] (%d pkgs) subsumed by [%s] (%d pkgs) — dropping",
+                a.getFileName(), pkgsA.size(), kept.getFileName(),
+                packagesByPath.getOrDefault(kept, Set.of()).size()));
+            superseded.add(a);
         }
 
         // -- Split-package resolution: tiered demotion policy
@@ -550,6 +618,20 @@ public final class ModuleGraphClassifier {
                         nonRequiredOwners.stream().map(p -> p.getFileName().toString()).toList()));
                     demoted.addAll(nonRequiredOwners);
                     continue;
+                }
+                if (requiredOwners.size() > 1) {
+                    // Two or more of the owners are each explicitly required by name, so tier
+                    // (a) can't prefer one over the other — falling through to tiers (b)/(c)
+                    // below may demote some or all of them off the module path, which will
+                    // leave a `requires` on that name unresolved downstream. Surface the real
+                    // cause here so that failure doesn't read as a mysterious "module not
+                    // found" with no link back to this split-package decision.
+                    log.accept(String.format(
+                        "  %d owners of [%s] are each explicitly required by name (%s) and genuinely "
+                            + "conflict — none can be safely preferred over the others; whichever ends up "
+                            + "demoted will leave its \"requires\" unresolved",
+                        requiredOwners.size(), entry.getKey(),
+                        requiredOwners.stream().map(p -> p.getFileName().toString()).toList()));
                 }
             }
 

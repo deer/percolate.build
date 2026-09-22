@@ -306,6 +306,20 @@ class ModuleGraphClassifierTest {
     }
 
     @Test
+    void resolveConflicts_multipleRequiredInConflict_logsWhichRequiredOwnersCollide() throws IOException {
+        // Both owners being demoted (the previous test) means both "requires" will fail to
+        // resolve downstream, with nothing pointing back at this split-package decision as
+        // the cause. A dedicated log message must name the colliding required owners so that
+        // failure is diagnosable instead of reading as an unexplained "module not found".
+        final Path a = automaticModule("mod-a.jar", "mod.a", "com/shared/A.class");
+        final Path b = automaticModule("mod-b.jar", "mod.b", "com/shared/B.class");
+        final var messages = new ArrayList<String>();
+        ModuleGraphClassifier.resolveConflicts(List.of(a, b), Set.of("mod.a", "mod.b"), messages::add);
+        assertThat(messages).anyMatch(msg -> msg.contains("explicitly required by name")
+            && msg.contains("mod-a.jar") && msg.contains("mod-b.jar"));
+    }
+
+    @Test
     void resolveConflicts_supersedesOlderVersionDuplicate() throws IOException {
         // Version dedupe: same base name, different versions → older superseded.
         final Path older = automaticModule("wildfly-common-2.0.0.jar", "wildfly.common",
@@ -330,6 +344,131 @@ class ModuleGraphClassifierTest {
             List.of(subset, superset), Set.of(), msg -> {
             });
         assertThat(resolution.superseded()).containsExactly(subset);
+        assertThat(resolution.demoted()).isEmpty();
+    }
+
+    @Test
+    void resolveConflicts_subsetJarRequiredByExactName_survivesInsteadOfBeingSuperseded() throws IOException {
+        final Path subset = automaticModule("lib-extra-1.0.jar", "lib.extra",
+            "com/example/Foo.class");
+        final Path superset = automaticModule("lib-2.0.jar", "lib.main",
+            "com/example/Foo.class", "com/example/sub/Bar.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(subset, superset), Set.of("lib.extra"), _ -> {
+            });
+        assertThat(resolution.superseded()).isEmpty();
+        assertThat(resolution.demoted()).containsExactly(superset);
+    }
+
+    @Test
+    void resolveConflicts_subsetJarRequiredByExactName_survivalIsLogged() throws IOException {
+        // A required module silently escaping subset dedupe (the previous test) is just as
+        // undiagnosable as a required module silently escaping the tiered demotion policy —
+        // the log must say why the jar wasn't dropped even though it looks subsumed.
+        final Path subset = automaticModule("lib-extra-1.0.jar", "lib.extra",
+            "com/example/Foo.class");
+        final Path superset = automaticModule("lib-2.0.jar", "lib.main",
+            "com/example/Foo.class", "com/example/sub/Bar.class");
+        final var messages = new ArrayList<String>();
+        ModuleGraphClassifier.resolveConflicts(List.of(subset, superset), Set.of("lib.extra"), messages::add);
+        assertThat(messages).anyMatch(msg -> msg.contains("explicitly required by name")
+            && msg.contains("lib-extra-1.0.jar") && msg.contains("lib-2.0.jar"));
+    }
+
+    @Test
+    void resolveConflicts_requiredModule_genuineSubsetVersionsStillDeduped() throws IOException {
+        // Regression: same module name declared by two differently-named jars (e.g. a
+        // repackaging/rename that left the filename base name different), where the older
+        // jar's packages are a genuine subset of the newer jar's. This specifically exercises
+        // subset dedupe rather than version dedupe — the two filenames deliberately don't
+        // share a base name, so version dedupe's grouping never sees them as a pair. Since
+        // both jars declare the exact same required module name, superseding the subset one
+        // is always safe — the required-name check must not block this like it does for a
+        // subset relationship between two genuinely different, unrelated modules.
+        final Path older = automaticModule("lib-repackaged-1.0.jar", "lib.required", "com/example/Foo.class");
+        final Path newer = automaticModule("lib-renamed-2.0.jar", "lib.required",
+            "com/example/Foo.class", "com/example/sub/Bar.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(older, newer), Set.of("lib.required"), msg -> {
+            });
+        assertThat(resolution.superseded()).containsExactly(older);
+        assertThat(resolution.demoted()).isEmpty();
+    }
+
+    @Test
+    void resolveConflicts_requiredModule_supersededWhenAGenuineDuplicateAlsoExists() throws IOException {
+        // Exotic ordering case: A is a package subset of TWO other candidates —
+        // 'sameModule', which is a genuine version/rename duplicate of A (same declared module
+        // name, more packages), and 'otherModule', an unrelated module that also happens to be
+        // a superset of A's packages. Subset dedupe walks A's candidate supersets in whatever
+        // order `remaining` (a LinkedHashSet built from a HashSet<Path>) iterates them in, which
+        // is not controlled by this test and is not guaranteed to put 'sameModule' first.
+        //
+        // If 'otherModule' happens to be visited before 'sameModule', the current subset-dedupe
+        // loop's required-name check breaks out on the first qualifying superset it sees: since
+        // A is required by name and 'otherModule' is a genuinely different module, it logs "keep
+        // for tier (a)" and stops looking — even though 'sameModule' (visited later, or never,
+        // depending on order) would have made dropping A unconditionally safe, exactly as in
+        // resolveConflicts_requiredModule_genuineSubsetVersionsStillDeduped above. This means A's
+        // fate depends on Path#hashCode-driven iteration order rather than on the actual jar
+        // graph — the correct outcome (A superseded by the genuine duplicate) must hold
+        // regardless of which superset the loop happens to examine first.
+        //
+        // Once A is (correctly) superseded, 'sameModule' and 'otherModule' still genuinely split
+        // "com.shared" between themselves — that's a separate, real split-package conflict, and
+        // tier (a) correctly demotes 'otherModule' since 'sameModule' is the required owner.
+        final Path a = automaticModule("a.jar", "mod.a", "com/shared/Foo.class");
+        final Path sameModule = automaticModule("a-renamed.jar", "mod.a",
+            "com/shared/Foo.class", "com/shared/sub/Bar.class");
+        final Path otherModule = automaticModule("unrelated.jar", "mod.other",
+            "com/shared/Foo.class", "com/shared/sub2/Baz.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(a, sameModule, otherModule), Set.of("mod.a"), msg -> {
+            });
+        assertThat(resolution.superseded()).containsExactly(a);
+        assertThat(resolution.demoted()).containsExactly(otherModule);
+    }
+
+    @Test
+    void resolveConflicts_requiredModuleNotSupersededByVersionDedupe() throws IOException {
+        // Version dedupe groups purely by filename base name, not module identity — two
+        // unrelated modules that happen to share a filename base name (e.g. both published
+        // as "lib-<version>.jar" by different projects) must not let the "older" one be
+        // dropped by filename-version comparison alone when it's the one the caller
+        // explicitly required by name. Mirrors the subset-dedupe fix: the required owner
+        // must survive to tier (a) instead of being silently dropped by an earlier dedupe pass.
+        final Path required = automaticModule("lib-1.0.jar", "mod.required", "com/shared/Foo.class");
+        final Path other = automaticModule("lib-2.0.jar", "mod.other", "com/shared/Bar.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(required, other), Set.of("mod.required"), msg -> {
+            });
+        assertThat(resolution.superseded()).isEmpty();
+        assertThat(resolution.demoted()).containsExactly(other);
+    }
+
+    @Test
+    void resolveConflicts_requiredModuleNotSupersededByVersionDedupe_survivalIsLogged() throws IOException {
+        final Path required = automaticModule("lib-1.0.jar", "mod.required", "com/shared/Foo.class");
+        final Path other = automaticModule("lib-2.0.jar", "mod.other", "com/shared/Bar.class");
+        final var messages = new ArrayList<String>();
+        ModuleGraphClassifier.resolveConflicts(List.of(required, other), Set.of("mod.required"), messages::add);
+        assertThat(messages).anyMatch(msg -> msg.contains("explicitly required by name")
+            && msg.contains("lib-1.0.jar") && msg.contains("lib-2.0.jar"));
+    }
+
+    @Test
+    void resolveConflicts_requiredModule_genuineVersionDuplicatesStillDeduped() throws IOException {
+        // Regression: two physical jars declaring the SAME module name (a true version
+        // duplicate, not a filename coincidence between two different modules) where that
+        // name is required. Deduping to the newest must still happen — either jar satisfies
+        // the same `requires` — since the tier (a) protection only needs to apply when the
+        // survivor is a genuinely different, unrelated module.
+        final Path older = automaticModule("mod-required-1.0.jar", "mod.required", "com/shared/Foo.class");
+        final Path newer = automaticModule("mod-required-2.0.jar", "mod.required", "com/shared/Foo.class");
+        final var resolution = ModuleGraphClassifier.resolveConflicts(
+            List.of(older, newer), Set.of("mod.required"), msg -> {
+            });
+        assertThat(resolution.superseded()).containsExactly(older);
         assertThat(resolution.demoted()).isEmpty();
     }
 
@@ -675,8 +814,8 @@ class ModuleGraphClassifierTest {
     @Test
     void closeOverRequires_emptySeedReturnsEmpty() throws IOException {
         final Path any = automaticModule("any.jar", "mod.any", "com/any/A.class");
-        assertThat(ModuleGraphClassifier.closeOverRequires(List.of(any), Set.of()))
-            .isEmpty();
+        assertThat(ModuleGraphClassifier.closeOverRequires(List.of(any), Set.of(), msg -> {
+        })).isEmpty();
     }
 
     @Test
@@ -688,7 +827,8 @@ class ModuleGraphClassifierTest {
         final Path root = properModule("root.jar", "mod.root",
             List.of("mod.mid"), "com/root/R.class");
         final Set<String> required = ModuleGraphClassifier.closeOverRequires(
-            List.of(root, mid, leaf), Set.of("mod.root"));
+            List.of(root, mid, leaf), Set.of("mod.root"), msg -> {
+            });
         assertThat(required).contains("mod.root", "mod.mid", "mod.leaf", "java.base");
     }
 
@@ -702,7 +842,8 @@ class ModuleGraphClassifierTest {
         final Path root = properModule("root.jar", "mod.root",
             List.of("mod.leaf"), "com/root/R.class");
         final Set<String> required = ModuleGraphClassifier.closeOverRequires(
-            List.of(poison, root, leaf), Set.of("mod.root"));
+            List.of(poison, root, leaf), Set.of("mod.root"), msg -> {
+            });
         assertThat(required).contains("mod.root", "mod.leaf");
     }
 
@@ -712,7 +853,8 @@ class ModuleGraphClassifierTest {
         // protection works for modules that sit alongside a split-package sibling.
         final Path any = automaticModule("any.jar", "mod.any", "com/any/A.class");
         final Set<String> required = ModuleGraphClassifier.closeOverRequires(
-            List.of(any), Set.of("mod.ghost"));
+            List.of(any), Set.of("mod.ghost"), msg -> {
+            });
         assertThat(required).contains("mod.ghost");
     }
 
