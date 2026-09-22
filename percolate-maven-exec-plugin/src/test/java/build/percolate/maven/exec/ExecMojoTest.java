@@ -139,16 +139,6 @@ class ExecMojoTest {
     }
 
     @Test
-    void resolveCandidates_unknownScope_throwsIllegalArgumentException() {
-        final ExecMojo mojo = new ExecMojo();
-        setField(mojo, "scope", "bogus");
-
-        assertThatThrownBy(mojo::resolveCandidates)
-            .isInstanceOf(IllegalArgumentException.class)
-            .hasMessageContaining("bogus");
-    }
-
-    @Test
     void execute_blankMainClass_throwsMojoExecutionException() {
         final ExecMojo mojo = new ExecMojo();
         mojo.setLog(new SystemStreamLog());

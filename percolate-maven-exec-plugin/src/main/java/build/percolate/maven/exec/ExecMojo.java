@@ -67,6 +67,34 @@ import java.util.stream.Collectors;
     threadSafe = true)
 public class ExecMojo extends AbstractMojo {
 
+    /**
+     * Source of jar candidates for the {@link #scope} parameter. Lowercase constant names so the
+     * enum's {@code valueOf} binding accepts exactly the same command-line and POM values
+     * ({@code compile}, {@code runtime}, {@code test}, {@code plugin}) that the parameter took
+     * back when it was a plain {@code String} — an enum-typed {@code @Parameter} gets Maven to
+     * reject an unknown value at binding time (before {@link #execute()} even runs) and documents
+     * the valid set automatically in generated plugin docs ({@code mvn help:describe}).
+     */
+    public enum Scope {
+        /**
+         * The project's compile classpath.
+         */
+        compile,
+        /**
+         * The project's runtime classpath.
+         */
+        runtime,
+        /**
+         * The project's test classpath.
+         */
+        test,
+        /**
+         * The plugin's own class realm, for self-hosting builds where the target jars are loaded
+         * as plugin dependencies rather than project dependencies.
+         */
+        plugin
+    }
+
     @Parameter(defaultValue = "${project}", readonly = true, required = true)
     private MavenProject project;
 
@@ -88,12 +116,10 @@ public class ExecMojo extends AbstractMojo {
     private String rootModule;
 
     /**
-     * Source of jar candidates: {@code compile}, {@code runtime}, {@code test}, or {@code plugin}.
-     * Use {@code plugin} to classify the plugin's own class realm (for self-hosting builds where
-     * the target jars are loaded as plugin dependencies rather than project dependencies).
+     * Source of jar candidates. See {@link Scope} for the valid values.
      */
     @Parameter(property = "percolate.exec.scope", defaultValue = "runtime")
-    private String scope;
+    private Scope scope;
 
     /**
      * Optional {@code -Xmx} value, e.g. {@code 512m}. Omitted when blank.
@@ -108,14 +134,17 @@ public class ExecMojo extends AbstractMojo {
     private List<String> additionalJvmArgs;
 
     /**
-     * Whitespace-separated JVM flags, split into tokens and used <em>instead of</em>
-     * {@link #additionalJvmArgs} when non-blank.
+     * Shell-word-tokenized (see {@link ParameterOverrides#tokenize}) JVM flags, split into tokens
+     * and used <em>instead of</em> {@link #additionalJvmArgs} when non-blank.
      * <p>
      * {@link #additionalJvmArgs} is a {@code List<String>}, which Maven can only populate from
      * POM {@code <additionalJvmArg>} elements — there's no way to override it from the command
      * line. This property exists for exactly that case: overriding JVM flags ad-hoc as
      * {@code -Dpercolate.exec.jvmArgs="--enable-preview -ea"} for dev-loop use, without editing
      * the POM per invocation.
+     * <p>
+     * A flag value containing whitespace can be quoted, e.g.
+     * {@code -Dpercolate.exec.jvmArgs="-Dmyapp.greeting='hello world'"}.
      * <p>
      * The property is the short {@code jvmArgs} rather than {@code additionalJvmArgs} because the
      * latter is already bound as the {@code List} parameter's own property.
@@ -141,14 +170,18 @@ public class ExecMojo extends AbstractMojo {
     private List<String> arguments;
 
     /**
-     * Whitespace-separated arguments passed to {@code mainClass}, split into tokens and used
-     * <em>instead of</em> {@link #arguments} when non-blank.
+     * Shell-word-tokenized (see {@link ParameterOverrides#tokenize}) arguments passed to
+     * {@code mainClass}, split into tokens and used <em>instead of</em> {@link #arguments} when
+     * non-blank.
      * <p>
      * {@link #arguments} is a {@code List<String>}, which Maven can only populate from POM
      * {@code <argument>} elements — there's no way to override it from the command line. This
      * property exists for exactly that case: a POM execution that hardcodes no {@code <arguments>}
      * of its own, invoked ad-hoc as {@code -Dpercolate.exec.args="task1 task2 --flag"} for
      * dev-loop use, without editing the POM per invocation.
+     * <p>
+     * An argument containing whitespace can be quoted, e.g.
+     * {@code -Dpercolate.exec.args="build --message 'hello world'"}.
      * <p>
      * The property is the short {@code args} rather than {@code arguments} because the latter is
      * already bound as the {@code List} parameter's own property.
@@ -198,8 +231,6 @@ public class ExecMojo extends AbstractMojo {
             candidates = resolveCandidates();
         } catch (final DependencyResolutionRequiredException e) {
             throw new MojoExecutionException("Failed to resolve candidates: " + e.getMessage(), e);
-        } catch (final IllegalArgumentException e) {
-            throw new MojoExecutionException(e.getMessage(), e);
         }
 
         getLog().info("classifying " + candidates.size() + " candidates (scope=" + scope + ")");
@@ -259,16 +290,14 @@ public class ExecMojo extends AbstractMojo {
 
     List<Path> resolveCandidates() throws DependencyResolutionRequiredException {
         return switch (scope) {
-            case "compile" -> toPathList(project.getCompileClasspathElements());
-            case "runtime" -> toPathList(project.getRuntimeClasspathElements());
-            case "test" -> toPathList(project.getTestClasspathElements());
-            case "plugin" -> pluginDescriptor.getArtifacts().stream()
+            case compile -> toPathList(project.getCompileClasspathElements());
+            case runtime -> toPathList(project.getRuntimeClasspathElements());
+            case test -> toPathList(project.getTestClasspathElements());
+            case plugin -> pluginDescriptor.getArtifacts().stream()
                 .map(Artifact::getFile)
                 .filter(Objects::nonNull)
                 .map(File::toPath)
                 .toList();
-            default -> throw new IllegalArgumentException("Unknown scope: " + scope
-                + " (expected compile, runtime, test, or plugin)");
         };
     }
 
